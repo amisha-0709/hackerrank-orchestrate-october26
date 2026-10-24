@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,23 @@ def read_csv(name: str):
         return list(csv.DictReader(f))
 
 
+def policy_actions():
+    """Load, rather than invent, the policy actions used by the audit plan."""
+    return {row["data_category"]: row["required_action"] for row in read_csv("deletion_rules.csv")}
+
+
+POLICY_ACTIONS = policy_actions()
+
+
+def activity_identity_links():
+    """Activity rows corroborate identity-to-resource links but never prove state."""
+    links = defaultdict(str)
+    for row in read_csv("system_activity.csv"):
+        if row["event_type"] == "LINK_RESOURCE_IDENTITY":
+            links[row["resource_id"]] += " " + row["details"]
+    return links
+
+
 def resource_system(resource: dict, default: str = "") -> str:
     return resource.get("data_store") or resource.get("origin_system") or default
 
@@ -45,6 +63,8 @@ def collection_category(system: str, record: dict, collection: str = "") -> str:
         return "flow"
     if "security" in text or "audit_event" in text or "integrity_seal" in text or "legal_hold" in text or "legal retention" in text:
         return "security"
+    if "attachment" in text and "support" in text:
+        return "support_attachment"
     if "support" in text or "ticket" in text or "attachment" in text:
         return "support"
     if "analytic" in text or "telemetry" in text:
@@ -73,12 +93,20 @@ def flatten(value):
 def direct_values(record: dict):
     """Values that establish a link; metrics and generic status strings cannot."""
     keys = {"user_id", "customer_reference", "subject_reference", "subject_selector", "subject_ref", "lookup_key",
-            "email", "phone", "email_hash", "full_name", "display_name", "name"}
+            "email", "phone", "email_hash", "full_name", "display_name", "name", "owner_email", "owner_phone",
+            "requester_email", "requester_phone", "customer_email"}
     values = set()
     for key, value in flatten(record):
         if key in keys and value not in (None, ""):
             values.add(norm(value))
     return values
+
+
+def has_direct_pii(record: dict) -> bool:
+    """Stable references are permitted for retained security/tombstone records."""
+    pii_keys = {"email", "requester_email", "owner_email", "customer_email", "phone", "requester_phone",
+                "owner_phone", "email_hash", "full_name", "display_name", "requester_name", "name"}
+    return any(key in pii_keys and value not in (None, "") for key, value in flatten(record))
 
 
 def parse_json_file(path: Path, file_id: str, captured: datetime):
@@ -107,24 +135,46 @@ def parse_json_file(path: Path, file_id: str, captured: datetime):
     return facts
 
 
-SQL_ROW = re.compile(r"INSERT INTO \"[^\"]+\" VALUES\('([^']*)','([^']*)','([^']*)','((?:[^']|'')*)','([^']*)'\);")
-
-
 def parse_sql(path: Path, file_id: str, captured: datetime):
+    """Load the SQLite-compatible snapshots using their real table schemas."""
     facts = []
-    for match in SQL_ROW.finditer(path.read_text(encoding="utf-8")):
-        rid, system, collection, blob, updated = match.groups()
-        try:
-            record = json.loads(blob.replace("''", "'"))
-        except json.JSONDecodeError:
-            continue
-        facts.append({"resource_id": rid, "system_id": system, "record": record,
-                      "collection": collection, "time": when(updated), "evidence_id": file_id})
+    table_system = {"customer_profiles": "account_service", "customer_search_documents": "search_service",
+                    "customer_analytics_profiles": "analytics_platform", "support_records": "support_platform",
+                    "customer_exports": "export_service", "connector_subscriptions": "integration_service",
+                    "backup_restore_entries": "backup_service", "security_audit_records": "security_service"}
+    try:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(path.read_text(encoding="utf-8"))
+        tables = [row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+        for table in tables:
+            if table == "snapshot_scope":
+                continue
+            columns = [row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')]
+            if "resource_id" not in columns:
+                continue
+            system = table_system.get(table, "")
+            for values in conn.execute(f'SELECT * FROM "{table}"'):
+                record = dict(zip(columns, values))
+                # Some replica exports store the useful object as record_json.
+                if isinstance(record.get("record_json"), str):
+                    try:
+                        record.update(json.loads(record["record_json"]))
+                    except json.JSONDecodeError:
+                        pass
+                stamp = record.get("updated_at") or record.get("captured_at") or captured.isoformat()
+                facts.append({"resource_id": record["resource_id"], "system_id": record.get("origin_system") or system,
+                              "record": record, "collection": record.get("collection_name") or table,
+                              "time": when(stamp), "evidence_id": file_id})
+    except sqlite3.Error:
+        return []
+    finally:
+        if 'conn' in locals(): conn.close()
     return facts
 
 
 def parse_log(path: Path, file_id: str, captured: datetime):
     facts = []
+    trace_links = defaultdict(dict)
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         rid = re.search(r"resource_id=([^\s]+)", line)
         service = re.search(r"service=([^\s]+)", line)
@@ -133,14 +183,21 @@ def parse_log(path: Path, file_id: str, captured: datetime):
         event = re.search(r"event=([^\s]+)", line)
         stamp = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)", line)
         record = {"resource_id": rid.group(1), "raw": line, "event": event.group(1) if event else ""}
+        trace = re.search(r"trace_id=([^\s]+)", line)
+        if trace:
+            record["trace_id"] = trace.group(1)
         # Carry links from structured correlation values into a record-like object.
         for key in ("correlation_key", "lookup_key", "subject_key", "subject_ref", "matched_value", "customer_reference", "email"):
             found = re.search(key + r'=(?:\"([^\"]+)\"|([^\s]+))', line)
             if found:
                 record[key] = found.group(1) or found.group(2)
+        if trace:
+            trace_links[trace.group(1)].update({k: v for k, v in record.items() if k in {"correlation_key", "lookup_key", "subject_key", "subject_ref", "matched_value", "customer_reference", "email"}})
         facts.append({"resource_id": rid.group(1), "system_id": service.group(1), "record": record,
                       "collection": "log_observation", "time": when(stamp.group(1)) if stamp else captured,
                       "evidence_id": file_id})
+    for fact in facts:
+        fact["record"].update(trace_links.get(fact["record"].get("trace_id"), {}))
     return facts
 
 
@@ -175,6 +232,7 @@ def parse_pdf(path: Path, file_id: str, captured: datetime, origin: str):
 
 def load_facts():
     facts = []
+    activity_links = activity_identity_links()
     prefix_system = {"account": "account_service", "search": "search_service", "analytics": "analytics_platform",
                      "support": "support_platform", "export": "export_service", "backup": "backup_service",
                      "data_flow": "integration_service", "audit_record": "security_service", "tombstone": "identity_service",
@@ -193,6 +251,8 @@ def load_facts():
         else:
             parsed = []
         for fact in parsed:
+            if fact["resource_id"] in activity_links:
+                fact["record"]["activity_identity_link"] = activity_links[fact["resource_id"]]
             if not fact["system_id"]:
                 for prefix, system in prefix_system.items():
                     if fact["resource_id"].startswith(prefix + "_"):
@@ -227,7 +287,8 @@ def wants_deletion(text: str) -> bool:
 
 def linked(fact, ids):
     values = direct_values(fact["record"])
-    raw = fact["record"].get("raw", "")
+    raw = (fact["record"].get("raw", "") + " " + fact["record"].get("document_text", "") + " " +
+           fact["record"].get("activity_identity_link", ""))
     return bool(values & ids) or any(identifier and identifier in norm(raw) for identifier in ids)
 
 
@@ -241,8 +302,10 @@ def state(fact):
     if category == "backup":
         return ("blocked" if fact["record"].get("restore_allowed") is False else "active"), category
     values = direct_values(fact["record"])
-    if category in {"analytics", "support", "tombstone", "email_log"}:
+    if category == "analytics":
         return ("exposed" if values else "compliant"), category
+    if category in {"support", "tombstone", "email_log"}:
+        return ("exposed" if has_direct_pii(fact["record"]) else "compliant"), category
     return "present", category
 
 
@@ -251,6 +314,7 @@ ACTION = {"account": ("DELETE_RECORD", "VERIFY_RECORD_ABSENT", "ABSENT"),
           "export": ("DELETE_RECORD", "VERIFY_RECORD_ABSENT", "ABSENT"),
           "marketing": ("DELETE_RECORD", "VERIFY_RECORD_ABSENT", "ABSENT"),
           "support": ("REDACT_RECORD", "VERIFY_RECORD_REDACTED", "REDACTED"),
+          "support_attachment": ("DELETE_RECORD", "VERIFY_RECORD_ABSENT", "ABSENT"),
           "tombstone": ("REDACT_RECORD", "VERIFY_RECORD_REDACTED", "REDACTED"),
           "email_log": ("REDACT_RECORD", "VERIFY_RECORD_REDACTED", "REDACTED"),
           "analytics": ("ANONYMIZE_RECORD", "VERIFY_RECORD_ANONYMIZED", "ANONYMIZED"),
@@ -298,7 +362,7 @@ def audit(request, all_facts, identity_map):
         records.append((fact, condition, category))
     violations = []
     for fact, condition, category in records:
-        if category in {"account", "search", "export", "marketing"} and condition == "present":
+        if category in {"account", "search", "export", "marketing", "support_attachment"} and condition == "present":
             violations.append((fact, "present", category))
         elif category in {"support", "tombstone", "email_log", "analytics"} and condition == "exposed":
             violations.append((fact, "exposed", category))
@@ -311,7 +375,7 @@ def audit(request, all_facts, identity_map):
         checks = []
         for fact, condition, category in records:
             remediate, verify, final = ACTION[category]
-            if (category in {"account", "search", "export", "marketing"} and condition == "absent") or \
+            if (category in {"account", "search", "export", "marketing", "support_attachment"} and condition == "absent") or \
                (category in {"support", "tombstone", "email_log", "analytics"} and condition == "compliant") or \
                (category == "security" and condition == "present") or \
                (category == "flow" and condition == "disabled") or (category == "backup" and condition == "blocked"):
