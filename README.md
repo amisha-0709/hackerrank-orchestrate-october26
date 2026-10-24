@@ -39,6 +39,24 @@ python3 code/main.py
 
 The blank template at `dataset/output.csv` is provided as a reference. Your final generated file for submission must be the root-level `output.csv`.
 
+## Included audit agent
+
+`code/main.py` implements a deterministic evidence-first audit agent. It resolves current and historical identifiers, parses participant-visible JSON, SQL, and text-log evidence, selects the newest linked evidence capture available at each audit cutoff, applies the deletion policy, and writes the required root-level `output.csv`.
+
+No package installation or credentials are required. Run the full prediction set with:
+
+```bash
+python code/main.py
+```
+
+Evaluate against the public sample set with:
+
+```bash
+python code/evaluation/main.py
+```
+
+Known limitation: PDF text is extracted with `pdfplumber`, but this runtime has no OCR engine for the supplied screenshots. The agent therefore does not derive facts exclusively visible in image evidence. The included evaluation report records the measured public-sample result rather than overstating it.
+
 
 ## Dataset
 
